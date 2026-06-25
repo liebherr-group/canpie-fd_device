@@ -691,7 +691,6 @@ CpStatus_tv CpCoreCanMode(CpPort_ts * ptsPortV, uint8_t ubModeV)
 //----------------------------------------------------------------------------//
 CpStatus_tv CpCoreCanState(CpPort_ts * ptsPortV, CpState_ts * ptsStateV)
 {
-	uint32_t hal_error;
 	uint32_t hal_esr;
 
 	CpStatus_tv tvStatusT = eCP_ERR_CHANNEL;
@@ -705,65 +704,20 @@ CpStatus_tv CpCoreCanState(CpPort_ts * ptsPortV, CpState_ts * ptsStateV)
 		{
 			tvStatusT = eCP_ERR_NONE;
 
+			//----------------------------------------------------------------
+			// Read state/type directly from the bxCAN ESR. The HAL keeps a
+			// bitwise-OR latched ErrorCode (HAL_CAN_GetError) that is never
+			// cleared on its own, so HAL_CAN_ERROR_EPV/BOF/BIT0 stay set long
+			// after TEC/REC have decayed to 0. ESR.EWGF/EPVF/BOFF are live
+			// hardware status flags and ESR.LEC reflects the most recent
+			// error event (cleared by hardware to 000 on each successful
+			// transfer), which is what we want here.
+			//
+			hal_esr = HCAN1.Instance->ESR;
+
 			// first set the state of the bus
 			ptsStateV->ubCanErrState = eCP_STATE_BUS_ACTIVE;
 
-			// so using this function is maybe not the right way because
-			// the error is only handled trough the interrupt handler so
-			// maybe it is better to read the status register by hand
-			hal_error = HAL_CAN_GetError(&HCAN1);
-
-			if (hal_error & HAL_CAN_ERROR_EWG)
-			{
-				ptsStateV->ubCanErrState = eCP_STATE_BUS_WARN;
-			}
-
-			if (hal_error & HAL_CAN_ERROR_EPV)
-			{
-				ptsStateV->ubCanErrState = eCP_STATE_BUS_PASSIVE;
-			}
-
-			if (hal_error & HAL_CAN_ERROR_BOF)
-			{
-				ptsStateV->ubCanErrState = eCP_STATE_BUS_OFF;
-			}
-
-			// now set the errors first start with error none
-			ptsStateV->ubCanErrType = eCP_ERR_TYPE_NONE;
-
-			if (hal_error & HAL_CAN_ERROR_STF)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_STUFF;
-			}
-
-			if (hal_error & HAL_CAN_ERROR_FOR)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_FORM;
-			}
-
-			if (hal_error & HAL_CAN_ERROR_ACK)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_ACK;
-			}
-
-			// bit recessive error
-			if (hal_error & HAL_CAN_ERROR_BD)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_BIT0;
-			}
-
-			// bit dominant error
-			if (hal_error & HAL_CAN_ERROR_BR)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_BIT1;
-			}
-
-			if (hal_error & HAL_CAN_ERROR_CRC)
-			{
-				ptsStateV->ubCanErrType = eCP_ERR_TYPE_CRC;
-			}
-			
-#if 0
 			if (hal_esr & CAN_ESR_EWGF)
 			{
 				ptsStateV->ubCanErrState = eCP_STATE_BUS_WARN;
@@ -801,26 +755,30 @@ CpStatus_tv CpCoreCanState(CpPort_ts * ptsPortV, CpState_ts * ptsStateV)
 					ptsStateV->ubCanErrType = eCP_ERR_TYPE_BIT0;
 					break;
 				case (CAN_ESR_LEC_2 | CAN_ESR_LEC_0):
-					/* Set CAN error code to BD error */
+					/* bit dominant error */
 					ptsStateV->ubCanErrType = eCP_ERR_TYPE_BIT1;
 					break;
 				case (CAN_ESR_LEC_2 | CAN_ESR_LEC_1):
-					/* Set CAN error code to CRC error */
+					/* CRC error */
 					ptsStateV->ubCanErrType = eCP_ERR_TYPE_CRC;
 					break;
 				default:
 					break;
 			}
-#endif
 
 			//----------------------------------------------------------------
 			// get current error counter
 			//
-			hal_esr = (HCAN1.Instance->ESR) >> 16;
-			ptsStateV->ubCanTrmErrCnt = (uint8_t) (hal_esr & 0x000000FF);
-			hal_esr = hal_esr >> 8;
-			ptsStateV->ubCanRcvErrCnt = (uint8_t) (hal_esr & 0x000000FF);
+			ptsStateV->ubCanTrmErrCnt = (uint8_t) ((hal_esr >> 16) & 0xFFu);
+			ptsStateV->ubCanRcvErrCnt = (uint8_t) ((hal_esr >> 24) & 0xFFu);
 
+			//----------------------------------------------------------------
+			// Clear LEC so the bxCAN does not keep re-firing the LEC change
+			// interrupt (and thus does not keep re-OR'ing HAL_CAN_ERROR_xxx
+			// into hcan->ErrorCode) while the bus is recovering. Hardware
+			// will set LEC again on the very next real error event.
+			//
+			CLEAR_BIT(HCAN1.Instance->ESR, CAN_ESR_LEC);
 		}
 	}
 
@@ -889,7 +847,11 @@ CpStatus_tv CpCoreDriverInit(uint8_t ubPhyIfV, CpPort_ts * ptsPortV, uint8_t ubC
 //				HCAN1.Init.TimeSeg1 = CAN_BS1_1TQ;
 //				HCAN1.Init.TimeSeg2 = CAN_BS2_1TQ;
 				HCAN1.Init.TimeTriggeredMode = DISABLE;
-				HCAN1.Init.AutoBusOff = DISABLE;
+				/* ABOM = 1: hardware automatically leaves bus-off after
+				 * 128 occurrences of 11 consecutive recessive bits. Without
+				 * this the controller stays in bus-off forever (since the
+				 * li_can_slv online reconnect path is disabled). */
+				HCAN1.Init.AutoBusOff = ENABLE;
 				HCAN1.Init.AutoWakeUp = DISABLE;
 				HCAN1.Init.AutoRetransmission = ENABLE;
 				HCAN1.Init.ReceiveFifoLocked = DISABLE;
